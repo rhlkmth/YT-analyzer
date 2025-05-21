@@ -22,37 +22,37 @@ SHORTS_LIMIT_SEC_DEFAULT = 180
 
 # ---------- DATA HELPERS ----------
 def check_if_short(duration_iso: str, limit_sec: int = SHORTS_LIMIT_SEC_DEFAULT) -> bool:
-    hours = minutes = seconds = 0
+    h = m = s = 0
     d = duration_iso.replace("PT", "")
     if "H" in d:
-        hours, d = d.split("H")
-        hours = int(hours)
+        h, d = d.split("H")
+        h = int(h)
     if "M" in d:
-        minutes, d = d.split("M")
-        minutes = int(minutes)
+        m, d = d.split("M")
+        m = int(m)
     if "S" in d:
-        seconds = int(d.replace("S", ""))
-    return hours * 3600 + minutes * 60 + seconds <= limit_sec
+        s = int(d.replace("S", ""))
+    return h * 3600 + m * 60 + s <= limit_sec
 
 
 def get_all_video_ids(api, channel_id: str) -> list[str]:
-    uploads_pl = (
+    uploads_id = (
         api.channels()
         .list(part="contentDetails", id=channel_id)
         .execute()["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
     )
-    vids, nxt = [], None
+    ids, nxt = [], None
     while True:
-        resp = (
+        pl = (
             api.playlistItems()
-            .list(part="contentDetails", playlistId=uploads_pl, maxResults=50, pageToken=nxt)
+            .list(part="contentDetails", playlistId=uploads_id, maxResults=50, pageToken=nxt)
             .execute()
         )
-        vids.extend(i["contentDetails"]["videoId"] for i in resp["items"])
-        nxt = resp.get("nextPageToken")
+        ids.extend(i["contentDetails"]["videoId"] for i in pl["items"])
+        nxt = pl.get("nextPageToken")
         if not nxt:
             break
-    return vids
+    return ids
 
 
 def get_video_details(api, video_ids: list[str], short_limit: int) -> pd.DataFrame:
@@ -65,6 +65,7 @@ def get_video_details(api, video_ids: list[str], short_limit: int) -> pd.DataFra
         )
         for itm in resp["items"]:
             pub_dt = datetime.strptime(itm["snippet"]["publishedAt"], "%Y-%m-%dT%H:%M:%SZ")
+            iso_dur = itm["contentDetails"]["duration"]
             rows.append(
                 {
                     "video_id": itm["id"],
@@ -72,17 +73,10 @@ def get_video_details(api, video_ids: list[str], short_limit: int) -> pd.DataFra
                     "published_date": pub_dt.date(),
                     "month": pub_dt.strftime("%B %Y"),
                     "view_count": int(itm["statistics"].get("viewCount", 0)),
-                    "duration_sec": None,  # filled below
-                    "form": None,  # filled below
+                    "duration_iso": iso_dur,
+                    "form": "Short" if check_if_short(iso_dur, short_limit) else "Long",
                 }
             )
-            rows[-1]["duration_sec"] = (
-                lambda d=itm["contentDetails"]["duration"]: (
-                    check_if_short(d, short_limit),
-                    d,
-                )
-            )()[1]  # keep ISO duration for table
-            rows[-1]["form"] = "Short" if check_if_short(itm["contentDetails"]["duration"], short_limit) else "Long"
     return pd.DataFrame(rows)
 
 
@@ -96,7 +90,6 @@ def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
                 "longs": g.apply(lambda x: (x["form"] == "Long").sum()),
                 "total_views": g["view_count"].sum(),
                 "avg_views": g["view_count"].mean().astype(int),
-                "median_views": g["view_count"].median().astype(int),
             }
         )
         .reset_index()
@@ -120,96 +113,88 @@ def top_n(df: pd.DataFrame, n=20) -> pd.DataFrame:
     return top.reset_index(drop=True)
 
 
-def to_excel(
-    raw_df: pd.DataFrame,
-    summary_df: pd.DataFrame,
-    bracket_df: pd.DataFrame,
-    top_df: pd.DataFrame,
-) -> bytes:
+def to_excel(raw_df, summary_df, bracket_df, top_df) -> bytes:
     with BytesIO() as bio:
         with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
             raw_df.to_excel(xw, sheet_name="Raw Data", index=False)
             summary_df.to_excel(xw, sheet_name="Monthly Summary", index=False)
             bracket_df.to_excel(xw, sheet_name="View Brackets", index=False)
             top_df.to_excel(xw, sheet_name="Top 20 Videos", index=False)
-
-            # overview sheet
-            ov = xw.book.add_worksheet("Overview")
-            ov.write_row(
-                0,
-                0,
-                ["Total videos", len(raw_df), "Total views", int(raw_df["view_count"].sum())],
-            )
-            ov.write_row(
-                2,
-                0,
-                ["Shorts", (raw_df["form"] == "Short").sum(), "Longs", (raw_df["form"] == "Long").sum()],
-            )
-
         bio.seek(0)
         return bio.read()
 
-# ---------- STREAMLIT UI ----------
-st.title("YouTube Channel Analyzer")
+# ---------- UI ----------
+st.set_page_config(page_title="YT Analyzer", page_icon="📊", layout="centered")
 
-api_key = st.text_input("YouTube API Key", type="password")
-channel_input = st.text_input("Channel ID or URL")
-analyze_all = st.checkbox("Analyze entire history", value=True)
+st.title("📊 YouTube Channel Analyzer")
 
-col1, col2 = st.columns(2)
-if not analyze_all:
-    start_date = col1.date_input("Start date", value=date(2010, 1, 1))
-    end_date = col2.date_input("End date", value=date.today())
-else:
-    start_date = date(1970, 1, 1)
-    end_date = date.today()
+with st.sidebar:
+    st.header("Inputs")
+    api_key = st.text_input("API Key", type="password")
+    channel_input = st.text_input("Channel ID / URL")
+    full_hist = st.checkbox("Use entire history", value=True)
+    if not full_hist:
+        dr = st.date_input("Date range", [date(2010, 1, 1), date.today()])
+        start_date, end_date = dr[0], dr[1]
+    else:
+        start_date, end_date = date(1970, 1, 1), date.today()
 
-short_limit = st.slider("Shorts length threshold (sec)", 1, 180, SHORTS_LIMIT_SEC_DEFAULT)
+    short_limit = st.slider("Shorts max length (sec)", 15, 180, SHORTS_LIMIT_SEC_DEFAULT, 15)
 
-viewbr_json = st.text_area(
-    "Custom view-bracket JSON (optional)",
-    value=str(DEFAULT_VIEW_BRACKETS),
-    height=150,
-)
+    with st.expander("Advanced options"):
+        vb_opt = st.checkbox("Custom view brackets")
+        viewbr_text = st.text_area(
+            "Bracket dict (name: [low, high])", value=str(DEFAULT_VIEW_BRACKETS), height=120
+        )
 
-run_btn = st.button("Run analysis")
+    run = st.button("Run analysis")
 
-if run_btn:
+if run:
     if not api_key or not channel_input:
-        st.error("API key and channel ID/URL are required.")
+        st.error("API key and channel ID/URL required")
         st.stop()
 
-    channel_id = channel_input.strip()
-    if "youtube.com" in channel_id:
-        # simplistic parse
-        channel_id = channel_id.split("/")[-1]
+    cid = channel_input.strip()
+    if "youtube.com" in cid:
+        cid = cid.split("/")[-1]
 
     yt = build("youtube", "v3", developerKey=api_key)
-    with st.spinner("Fetching video list…"):
-        ids = get_all_video_ids(yt, channel_id)
-    with st.spinner("Fetching video details…"):
-        df = get_video_details(yt, ids, short_limit)
 
-    df = df[(df["published_date"] >= start_date) & (df["published_date"] <= end_date)].reset_index(drop=True)
+    st.info("Fetching videos…")
+    ids = get_all_video_ids(yt, cid)
+    st.write(f"Total videos: {len(ids)}")
 
-    summary = monthly_summary(df)
-    brackets_dict = DEFAULT_VIEW_BRACKETS
-    try:
-        custom_br = eval(viewbr_json)
-        if isinstance(custom_br, dict):
-            brackets_dict = custom_br
-    except Exception:
-        st.warning("Invalid custom bracket JSON; using defaults.")
+    st.info("Collecting details…")
+    data = get_video_details(yt, ids, short_limit)
+    data = data[(data["published_date"] >= start_date) & (data["published_date"] <= end_date)].reset_index(drop=True)
 
-    bracket = view_bracket_split(df, brackets_dict)
-    top20 = top_n(df)
+    if data.empty:
+        st.warning("No videos in selected range")
+        st.stop()
 
-    excel_bytes = to_excel(df, summary, bracket, top20)
-    st.success("Analysis complete.")
+    # brackets
+    brackets = DEFAULT_VIEW_BRACKETS
+    if vb_opt:
+        try:
+            custom_br = eval(viewbr_text)
+            if isinstance(custom_br, dict):
+                brackets = {k: tuple(v) for k, v in custom_br.items()}
+        except Exception:
+            st.warning("Invalid custom brackets; using defaults")
+
+    summary = monthly_summary(data)
+    bracket_df = view_bracket_split(data, brackets)
+    top20 = top_n(data)
+
+    excel = to_excel(data, summary, bracket_df, top20)
+
+    st.success("Done")
     st.download_button(
-        "Download Excel",
-        data=excel_bytes,
+        "Download Excel report",
+        data=excel,
         file_name="youtube_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+    st.subheader("Preview")
+    st.dataframe(summary.head())
