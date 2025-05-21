@@ -130,7 +130,7 @@ st.title("📊 YouTube Channel Analyzer")
 
 with st.sidebar:
     st.header("Inputs")
-    api_key = st.text_input("API Key", type="password")
+    api_key = st.text_input("API Key")  # visible text field
     channel_input = st.text_input("Channel ID / URL")
     full_hist = st.checkbox("Use entire history", value=True)
     if not full_hist:
@@ -172,7 +172,6 @@ if run:
         st.warning("No videos in selected range")
         st.stop()
 
-    # brackets
     brackets = DEFAULT_VIEW_BRACKETS
     if vb_opt:
         try:
